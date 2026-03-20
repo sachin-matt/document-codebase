@@ -38,7 +38,7 @@ Plus a `mkdocs.yml` for instant browsable documentation.
 For the session-driver mode (parallel workers):
 - **tmux**
 - **jq**
-- [claude-session-driver](https://github.com/anthropics/claude-session-driver) cloned as a sibling directory
+- [claude-session-driver](https://github.com/obra/claude-session-driver) cloned as a sibling directory
 
 ## Quick Start
 
