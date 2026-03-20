@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # run-analysis.sh — Orchestrates Claude Code workers to analyze and document a codebase
-# Uses claude-session-driver for multi-session orchestration
-# Usage: run-analysis.sh <repo-path> <prompts-dir> <scripts-dir> [--parallel N] [--model MODEL] [--timeout SECS]
+# Uses claude-session-driver for multi-session orchestration with parallel workers.
+#
+# IMPORTANT: Prompts are written to temp files and the worker is told to read them,
+# because tmux send-keys -l cannot reliably paste multi-line text (60+ lines).
+#
+# Usage: run-analysis.sh <repo-path> <prompts-dir> <driver-scripts-dir> [--parallel N] [--model MODEL] [--timeout SECS]
 
 set -euo pipefail
 
-REPO_PATH="${1:?Usage: run-analysis.sh <repo-path> <prompts-dir> <scripts-dir> [--parallel N] [--model MODEL] [--timeout SECS]}"
+REPO_PATH="${1:?Usage: run-analysis.sh <repo-path> <prompts-dir> <driver-scripts-dir> [--parallel N] [--model MODEL] [--timeout SECS]}"
 PROMPTS_DIR="${2:?Missing prompts directory}"
 DRIVER_SCRIPTS="${3:?Missing claude-session-driver scripts directory}"
 
@@ -27,8 +31,12 @@ done
 
 DOCS_DIR="$REPO_PATH/docs"
 CONTEXT_DIR="$REPO_PATH/__dc_context"
+TEMP_PROMPTS_DIR="/tmp/dc-prompts-$$"
 
-mkdir -p "$DOCS_DIR"
+mkdir -p "$DOCS_DIR" "$TEMP_PROMPTS_DIR"
+
+# Cleanup temp directory on exit
+trap 'rm -rf "$TEMP_PROMPTS_DIR"' EXIT
 
 echo "========================================"
 echo " Codebase Documentation Generator"
@@ -53,7 +61,8 @@ if [ ! -f "$CONTEXT_DIR/file-tree.txt" ] || [ ! -f "$CONTEXT_DIR/metadata.json" 
 fi
 
 # --- Define documentation tasks ---
-ALL_PROMPTS=(
+# Phase 1: Independent analyses (can run in parallel)
+PHASE1_PROMPTS=(
   "architecture-overview"
   "api-routes"
   "authentication"
@@ -65,12 +74,20 @@ ALL_PROMPTS=(
   "cicd-pipelines"
   "dependency-map"
   "configuration"
+)
+
+# Phase 2: Depends on phase 1 (runs after all phase 1 workers finish)
+PHASE2_PROMPTS=(
   "getting-started"
 )
 
-# --- Sequential worker execution ---
-# Process each prompt one at a time using converse.sh for reliability
-run_prompt() {
+# --- Worker management ---
+# Arrays to track active workers (bash 3 compatible — no associative arrays needed)
+ACTIVE_NAMES=()
+ACTIVE_SIDS=()
+ACTIVE_TASKS=()
+
+launch_worker() {
   local prompt_name="$1"
   local worker_name="doc-${prompt_name}"
   local prompt_file="$PROMPTS_DIR/${prompt_name}.md"
@@ -80,46 +97,129 @@ run_prompt() {
     return 1
   fi
 
-  echo ""
-  echo "[===] Processing: $prompt_name"
-  echo "[launch] Starting worker: $worker_name"
+  # Write prompt to a temp file that the worker can read
+  local temp_prompt="$TEMP_PROMPTS_DIR/${prompt_name}.md"
+  cp "$prompt_file" "$temp_prompt"
 
+  echo "[launch] Starting worker: $worker_name"
   local result
   result=$("$DRIVER_SCRIPTS/launch-worker.sh" "$worker_name" "$REPO_PATH" --model "$MODEL" 2>&1) || {
-    echo "[ERROR] Failed to launch worker $worker_name" >&2
+    echo "[ERROR] Failed to launch worker $worker_name: $result" >&2
     return 1
   }
 
   local session_id
   session_id=$(echo "$result" | jq -r '.session_id')
 
-  echo "[send] Sending analysis task..."
-  local prompt_content
-  prompt_content=$(cat "$prompt_file")
+  # Send a SHORT instruction that tells the worker to read the prompt file.
+  # This avoids the tmux send-keys buffer overflow with large prompts.
+  local instruction="Read the file ${temp_prompt} — it contains your full instructions. Follow every instruction in that file exactly."
+  "$DRIVER_SCRIPTS/send-prompt.sh" "$worker_name" "$instruction"
 
-  # Use converse.sh for send-and-wait in one step
-  local response
-  response=$("$DRIVER_SCRIPTS/converse.sh" "$worker_name" "$session_id" "$prompt_content" "$TIMEOUT" 2>&1) || {
-    echo "[WARN] Worker $worker_name may have timed out or errored" >&2
-  }
+  echo "[send] Sent task to $worker_name: $prompt_name (reading from temp file)"
 
-  echo "[done] $prompt_name completed"
-
-  # Stop the worker
-  "$DRIVER_SCRIPTS/stop-worker.sh" "$worker_name" "$session_id" 2>/dev/null || true
+  # Track the active worker
+  ACTIVE_NAMES+=("$worker_name")
+  ACTIVE_SIDS+=("$session_id")
+  ACTIVE_TASKS+=("$prompt_name")
 
   return 0
 }
 
-# --- Execute all prompts ---
-TOTAL=${#ALL_PROMPTS[@]}
-CURRENT=0
+wait_for_any_worker() {
+  # Wait for the first active worker to finish, then remove it from tracking
+  if [ ${#ACTIVE_NAMES[@]} -eq 0 ]; then
+    return 1
+  fi
 
-for prompt_name in "${ALL_PROMPTS[@]}"; do
-  CURRENT=$((CURRENT + 1))
-  echo ""
-  echo "━━━ Task $CURRENT/$TOTAL: $prompt_name ━━━"
-  run_prompt "$prompt_name" || echo "[SKIP] Failed: $prompt_name"
+  # Poll all active workers, first to finish wins
+  while true; do
+    for i in "${!ACTIVE_NAMES[@]}"; do
+      local wname="${ACTIVE_NAMES[$i]}"
+      local sid="${ACTIVE_SIDS[$i]}"
+      local task="${ACTIVE_TASKS[$i]}"
+
+      # Check if this worker's stop event exists (non-blocking check)
+      if "$DRIVER_SCRIPTS/wait-for-event.sh" "$sid" stop 5 --after-line 0 >/dev/null 2>&1; then
+        echo "[done] $wname completed: $task"
+
+        # Stop and cleanup the worker
+        "$DRIVER_SCRIPTS/stop-worker.sh" "$wname" "$sid" 2>/dev/null || true
+
+        # Remove from active arrays
+        unset 'ACTIVE_NAMES[i]'
+        unset 'ACTIVE_SIDS[i]'
+        unset 'ACTIVE_TASKS[i]'
+        # Reindex arrays
+        ACTIVE_NAMES=("${ACTIVE_NAMES[@]}")
+        ACTIVE_SIDS=("${ACTIVE_SIDS[@]}")
+        ACTIVE_TASKS=("${ACTIVE_TASKS[@]}")
+        return 0
+      fi
+    done
+    # Brief sleep before polling again
+    sleep 2
+  done
+}
+
+wait_for_all_workers() {
+  while [ ${#ACTIVE_NAMES[@]} -gt 0 ]; do
+    wait_for_any_worker
+  done
+}
+
+cleanup_all_workers() {
+  for i in "${!ACTIVE_NAMES[@]}"; do
+    local wname="${ACTIVE_NAMES[$i]}"
+    local sid="${ACTIVE_SIDS[$i]}"
+    echo "[cleanup] Stopping $wname..."
+    "$DRIVER_SCRIPTS/stop-worker.sh" "$wname" "$sid" 2>/dev/null || true
+  done
+  ACTIVE_NAMES=()
+  ACTIVE_SIDS=()
+  ACTIVE_TASKS=()
+}
+
+# Trap to ensure workers are cleaned up on script exit
+trap 'cleanup_all_workers; rm -rf "$TEMP_PROMPTS_DIR"' EXIT
+
+# --- Phase 1: Run independent analyses with controlled parallelism ---
+echo ""
+echo "=== Phase 1: Independent Analyses (up to $MAX_PARALLEL parallel) ==="
+echo ""
+
+QUEUE=("${PHASE1_PROMPTS[@]}")
+TOTAL_PHASE1=${#PHASE1_PROMPTS[@]}
+LAUNCHED=0
+
+while [ ${#QUEUE[@]} -gt 0 ] || [ ${#ACTIVE_NAMES[@]} -gt 0 ]; do
+  # Launch workers up to MAX_PARALLEL
+  while [ ${#ACTIVE_NAMES[@]} -lt "$MAX_PARALLEL" ] && [ ${#QUEUE[@]} -gt 0 ]; do
+    next_task="${QUEUE[0]}"
+    QUEUE=("${QUEUE[@]:1}")  # Remove first element
+
+    LAUNCHED=$((LAUNCHED + 1))
+    echo ""
+    echo "━━━ [$LAUNCHED/$TOTAL_PHASE1] Launching: $next_task ━━━"
+    launch_worker "$next_task" || echo "[SKIP] Failed to launch: $next_task"
+  done
+
+  # Wait for one worker to finish before launching more
+  if [ ${#ACTIVE_NAMES[@]} -ge "$MAX_PARALLEL" ] || ([ ${#QUEUE[@]} -eq 0 ] && [ ${#ACTIVE_NAMES[@]} -gt 0 ]); then
+    wait_for_any_worker
+  fi
+done
+
+# --- Phase 2: Dependent analyses (sequential, after all phase 1 done) ---
+echo ""
+echo "=== Phase 2: Dependent Analyses ==="
+echo ""
+
+for prompt_name in "${PHASE2_PROMPTS[@]}"; do
+  echo "━━━ Phase 2: $prompt_name ━━━"
+  if launch_worker "$prompt_name"; then
+    wait_for_all_workers
+  fi
 done
 
 echo ""

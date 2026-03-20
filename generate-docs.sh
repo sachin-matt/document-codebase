@@ -165,9 +165,15 @@ else
 
     if [ "$MODE" = "session" ]; then
       WORKER_NAME="doc-${ONLY_PROMPT}"
+      # Write prompt to a temp file — tmux send-keys can't handle 60+ line prompts
+      TEMP_PROMPT="/tmp/dc-prompt-${ONLY_PROMPT}-$$.md"
+      cp "$PROMPT_FILE" "$TEMP_PROMPT"
+      trap 'rm -f "$TEMP_PROMPT"' EXIT
+
       RESULT=$("$DRIVER_PATH/launch-worker.sh" "$WORKER_NAME" "$REPO_PATH" --model "$MODEL")
       SESSION_ID=$(echo "$RESULT" | jq -r '.session_id')
-      "$DRIVER_PATH/converse.sh" "$WORKER_NAME" "$SESSION_ID" "$PROMPT_CONTENT" "$TIMEOUT" 2>/dev/null || true
+      INSTRUCTION="Read the file ${TEMP_PROMPT} — it contains your full instructions. Follow every instruction in that file exactly."
+      "$DRIVER_PATH/converse.sh" "$WORKER_NAME" "$SESSION_ID" "$INSTRUCTION" "$TIMEOUT" 2>/dev/null || true
       "$DRIVER_PATH/stop-worker.sh" "$WORKER_NAME" "$SESSION_ID" 2>/dev/null || true
     else
       echo "[run] Analyzing with Claude ($MODEL)..."
